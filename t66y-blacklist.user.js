@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discuz 黑名单屏蔽（t66y）
 // @namespace    https://t66y.com/
-// @version      2.0.0
+// @version      2.1.0
 // @description  按用户名或 UID 屏蔽用户，支持悬浮卡片、一键拉黑、取消拉黑、导入导出备份
 // @author       local
 // @match        *://t66y.com/thread0806.php*
@@ -14,9 +14,17 @@
 (function () {
   'use strict';
 
+  // 常量定义
   const STORAGE_KEY = '__t66y_blacklist_v2__';
   const HISTORY_CACHE_TTL = 10 * 60 * 1000;
   const HISTORY_PREVIEW_COUNT = 5;
+  const ZINDEX_TOOLBAR = 2147483646;
+  const ZINDEX_CARD = 2147483647;
+  const DEBOUNCE_APPLY_MS = 140;
+  const CARD_HIDE_DELAY_MS = 180;
+  const FETCH_TIMEOUT_MS = 8000;
+  const MEMORY_CLEANUP_INTERVAL_MS = 60000;
+  const MANAGER_PAGE_SIZE = 10;
 
   // 初始黑名单（仅首次运行时作为默认值导入）
   const CONFIG = {
@@ -41,17 +49,9 @@
   let managerNamePage = 1;
   let managerUidPage = 1;
   let managerKeywordPage = 1;
-  const MANAGER_PAGE_SIZE = 10;
   let isManagerComposing = false;
-  const AUTO_PAGER_BOTTOM_THRESHOLD = 320;
-  const autoPagerState = {
-    enabled: false,
-    loading: false,
-    bound: false,
-    nextUrl: '',
-    currentUrl: '',
-    loadedUrls: new Set(),
-  };
+  let cachedCardSize = null;
+  let keywordRegex = null;
 
   const blacklist = loadBlacklist();
 
@@ -71,15 +71,19 @@
     if (!href) return '';
     try {
       const url = new URL(href, location.origin);
-      const keys = ['uid', 'touid', 'search', 'authorid'];
+      // 优先匹配更明确的 UID 参数，避免 search 参数混淆
+      const keys = ['uid', 'authorid', 'touid'];
       for (const key of keys) {
         const value = url.searchParams.get(key);
         if (value && /^\d+$/.test(value)) return value;
       }
+      // search 参数作为兜底，但必须是纯数字
+      const search = url.searchParams.get('search');
+      if (search && /^\d+$/.test(search)) return search;
     } catch (e) {
       // 忽略 URL 解析失败，继续走正则兜底
     }
-    const m = String(href).match(/(?:uid|touid|search|authorid)=(\d+)/i);
+    const m = String(href).match(/(?:uid|authorid|touid)=(\d+)/i);
     return m ? m[1] : '';
   }
 
@@ -116,6 +120,20 @@
         keywords: Array.from(data.keywords),
       })
     );
+    // 关键词变化时重新构建正则
+    rebuildKeywordRegex();
+  }
+
+  function rebuildKeywordRegex() {
+    if (blacklist.keywords.size === 0) {
+      keywordRegex = null;
+      return;
+    }
+    // 转义特殊字符并构建正则
+    const escaped = Array.from(blacklist.keywords).map(kw =>
+      kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    );
+    keywordRegex = new RegExp(escaped.join('|'), 'i');
   }
 
   function isBlocked(username, uid) {
@@ -180,18 +198,19 @@
   }
 
   function isBlockedByKeyword(content) {
-    if (!content) return false;
-    const normalized = String(content).toLowerCase();
-    for (const keyword of blacklist.keywords) {
-      if (normalized.includes(keyword)) return true;
-    }
-    return false;
+    if (!content || !keywordRegex) return false;
+    return keywordRegex.test(String(content).toLowerCase());
   }
 
   function getPostAuthorInfo(block) {
-    const userName = (block.querySelector('tr.tr1.do_not_catch > th b')?.textContent || '').trim();
+    const thEl = block.querySelector('tr.tr1.do_not_catch > th');
+    const userNameEl = thEl?.querySelector('b');
+    let userName = (userNameEl?.textContent || '').trim();
+    // 移除 [楼主] 标记（可能在用户名后）
+    userName = userName.replace(/\s*\[樓主\]|\[楼主\]\s*/gi, '').trim();
+
     let uid = '';
-    const links = block.querySelectorAll('.tiptop a[href*="uid="], .tiptop a[href*="touid="], .tiptop a[href*="search="], .tiptop a[href*="authorid="], a[href*="uid="], a[href*="authorid="]');
+    const links = block.querySelectorAll('.tiptop a[href*="uid="], .tiptop a[href*="touid="], .tiptop a[href*="authorid="], a[href*="uid="], a[href*="authorid="]');
     for (const link of links) {
       uid = parseUidFromHref(link.getAttribute('href') || link.href);
       if (uid) break;
@@ -255,11 +274,15 @@
   }
 
   function clearBlacklist() {
+    if (!confirm('确定要清空所有黑名单数据吗？此操作无法撤销。')) {
+      return false;
+    }
     blacklist.usernames.clear();
     blacklist.uids.clear();
     blacklist.keywords.clear();
     persistBlacklist(blacklist);
     applyAll();
+    return true;
   }
 
   function exportBlacklistText() {
@@ -280,7 +303,11 @@
     try {
       parsed = JSON.parse(text);
     } catch (e) {
-      return { ok: false, message: '导入失败：JSON 格式无效' };
+      return { ok: false, message: `导入失败：JSON 格式无效 - ${e.message}` };
+    }
+
+    if (!parsed || typeof parsed !== 'object') {
+      return { ok: false, message: '导入失败：数据格式不是有效对象' };
     }
 
     const usernames = Array.isArray(parsed.usernames) ? parsed.usernames : [];
@@ -349,6 +376,15 @@
     });
   }
 
+  // 定期清理已移除的元素，防止内存泄漏
+  setInterval(() => {
+    hiddenElements.forEach((el) => {
+      if (!el || !el.isConnected) {
+        hiddenElements.delete(el);
+      }
+    });
+  }, MEMORY_CLEANUP_INTERVAL_MS);
+
   function applyPostPageBlacklist() {
     const postBlocks = Array.from(document.querySelectorAll('div.t.t2'));
     if (!postBlocks.length) return;
@@ -356,10 +392,14 @@
 
     postBlocks.forEach((block) => {
       const { userName, uid } = getPostAuthorInfo(block);
-      const isOPByTag = /\[樓主\]|\[楼主\]/i.test(userName);
+
+      // 楼主判断：检查 <b> 标签内是否包含 <span class="sgreen">[樓主]</span>
+      const thEl = block.querySelector('tr.tr1.do_not_catch > th');
+      const bEl = thEl?.querySelector('b');
+      const hasOPTag = bEl?.querySelector('span.sgreen') !== null;
       const isOPByUid = !!owner.uid && !!uid && owner.uid === uid;
       const isOPByName = !owner.uid && !!owner.userName && normalizeName(owner.userName) === normalizeName(userName);
-      const isOP = isOPByTag || isOPByUid || isOPByName;
+      const isOP = hasOPTag || isOPByUid || isOPByName;
 
       // 检查用户是否被屏蔽
       let blocked = isBlocked(userName, uid);
@@ -385,238 +425,13 @@
     return document.querySelectorAll('div.t.t2').length > 0;
   }
 
-  function hasHiddenRepliesOnPage() {
-    const postBlocks = document.querySelectorAll('div.t.t2');
-    if (!postBlocks.length) return false;
-    return Array.from(postBlocks).some((el) => el.dataset.tmBlacklistHidden === '1');
-  }
-
-  function getNextPageUrlFromDocument(doc) {
-    if (!doc) return '';
-    const linkCandidates = Array.from(doc.querySelectorAll('a[href]'));
-
-    // 1) 文本型“下一页”（简繁体）
-    for (const a of linkCandidates) {
-      const text = (a.textContent || '').replace(/\s+/g, '');
-      if (text === '下一页' || text === '下一頁' || text === '下页' || text === '下頁' || text.toLowerCase() === 'next') {
-        const href = a.getAttribute('href') || a.href || '';
-        if (href) return new URL(href, location.href).href;
-      }
-    }
-
-    // 2) rel=next
-    const relNext = doc.querySelector('a[rel="next"][href]');
-    if (relNext) return new URL(relNext.getAttribute('href') || relNext.href, location.href).href;
-
-    // 3) 数字分页：找到当前页数字后，取后一个页码链接
-    const pageLinks = linkCandidates
-      .map((a) => {
-        const text = (a.textContent || '').trim();
-        return { a, text, num: /^\d+$/.test(text) ? Number(text) : NaN };
-      })
-      .filter((x) => !Number.isNaN(x.num));
-    if (pageLinks.length) {
-      const currentMarks = Array.from(doc.querySelectorAll('b, strong, span, font'))
-        .map((el) => (el.textContent || '').trim())
-        .filter((t) => /^\d+$/.test(t))
-        .map((t) => Number(t));
-      const currentPage = currentMarks.length ? currentMarks[0] : NaN;
-      if (!Number.isNaN(currentPage)) {
-        const nextByNum = pageLinks.find((x) => x.num === currentPage + 1);
-        if (nextByNum) return new URL(nextByNum.a.getAttribute('href') || nextByNum.a.href, location.href).href;
-      }
-    }
-
-    // 4) URL 参数兜底递增（page / p / pageNo / pageNum）
-    try {
-      const url = new URL(doc.location?.href || location.href, location.href);
-      const keys = ['page', 'p', 'pageNo', 'pageNum'];
-      for (const key of keys) {
-        const val = url.searchParams.get(key);
-        if (val && /^\d+$/.test(val)) {
-          url.searchParams.set(key, String(Number(val) + 1));
-          return url.href;
-        }
-      }
-    } catch (e) {
-      // 忽略 URL 解析失败
-    }
-    return '';
-  }
-
-  function getNumericPageFromUrl(urlLike) {
-    try {
-      const url = new URL(urlLike, location.href);
-      const keys = ['page', 'p', 'pageNo', 'pageNum'];
-      for (const key of keys) {
-        const val = url.searchParams.get(key);
-        if (val && /^\d+$/.test(val)) return Number(val);
-      }
-    } catch (e) {
-      // 忽略解析失败
-    }
-    return NaN;
-  }
-
-  function buildUrlWithPage(urlLike, pageNum) {
-    try {
-      const url = new URL(urlLike, location.href);
-      const keys = ['page', 'p', 'pageNo', 'pageNum'];
-      for (const key of keys) {
-        const val = url.searchParams.get(key);
-        if (val !== null) {
-          url.searchParams.set(key, String(pageNum));
-          return url.href;
-        }
-      }
-      url.searchParams.set('page', String(pageNum));
-      return url.href;
-    } catch (e) {
-      return '';
-    }
-  }
-
-  function resolveNextPageUrl(doc, currentUrl) {
-    const explicit = getNextPageUrlFromDocument(doc);
-    const currentPage = getNumericPageFromUrl(currentUrl);
-    if (explicit) {
-      const explicitPage = getNumericPageFromUrl(explicit);
-      if (Number.isNaN(currentPage) || Number.isNaN(explicitPage) || explicitPage > currentPage) {
-        return explicit;
-      }
-    }
-
-    const links = Array.from(doc.querySelectorAll('a[href]'));
-    const candidates = links
-      .map((a) => new URL(a.getAttribute('href') || a.href || '', currentUrl || location.href).href)
-      .map((href) => ({ href, page: getNumericPageFromUrl(href) }))
-      .filter((x) => !Number.isNaN(x.page));
-    if (!Number.isNaN(currentPage) && candidates.length) {
-      const gt = candidates
-        .filter((x) => x.page > currentPage)
-        .sort((a, b) => a.page - b.page);
-      if (gt.length) return gt[0].href;
-      return buildUrlWithPage(currentUrl, currentPage + 1);
-    }
-    return explicit || '';
-  }
-
-  function normalizeUrlForCompare(urlLike) {
-    try {
-      const url = new URL(urlLike, location.href);
-      url.hash = '';
-      return url.href;
-    } catch (e) {
-      return String(urlLike || '');
-    }
-  }
-
-  function resolveUnloadedNextUrl(candidateUrl) {
-    if (!candidateUrl) return '';
-    let candidate = normalizeUrlForCompare(candidateUrl);
-    const visited = new Set();
-    for (let i = 0; i < 10; i += 1) {
-      if (!candidate || visited.has(candidate)) return '';
-      visited.add(candidate);
-      if (!autoPagerState.loadedUrls.has(candidate)) return candidate;
-      const page = getNumericPageFromUrl(candidate);
-      if (Number.isNaN(page)) return '';
-      candidate = normalizeUrlForCompare(buildUrlWithPage(candidate, page + 1));
-    }
-    return '';
-  }
-
-  function appendNextPageReplies(doc) {
-    const blocks = Array.from(doc.querySelectorAll('div.t.t2'));
-    if (!blocks.length) return 0;
-    const container = document.querySelector('#main, body');
-    if (!container) return 0;
-
-    const fragment = document.createDocumentFragment();
-    blocks.forEach((block) => {
-      const anchor = block.previousElementSibling;
-      if (anchor && anchor.tagName === 'A' && anchor.getAttribute('name')) {
-        fragment.appendChild(anchor.cloneNode(true));
-      }
-      fragment.appendChild(block.cloneNode(true));
-    });
-    container.appendChild(fragment);
-    return blocks.length;
-  }
-
-  async function loadNextPageReplies() {
-    if (!autoPagerState.enabled || autoPagerState.loading || !autoPagerState.nextUrl) return;
-    autoPagerState.nextUrl = resolveUnloadedNextUrl(autoPagerState.nextUrl);
-    if (!autoPagerState.nextUrl) return;
-
-    autoPagerState.loading = true;
-    const url = normalizeUrlForCompare(autoPagerState.nextUrl);
-    try {
-      autoPagerState.loadedUrls.add(url);
-      const resp = await fetch(url, { credentials: 'include' });
-      if (!resp.ok) return;
-      const html = await resp.text();
-      const doc = new DOMParser().parseFromString(html, 'text/html');
-      const inserted = appendNextPageReplies(doc);
-      autoPagerState.currentUrl = url;
-      autoPagerState.nextUrl = resolveNextPageUrl(doc, url);
-      if (autoPagerState.nextUrl === url || autoPagerState.loadedUrls.has(normalizeUrlForCompare(autoPagerState.nextUrl))) {
-        const currentPage = getNumericPageFromUrl(url);
-        autoPagerState.nextUrl = Number.isNaN(currentPage) ? '' : buildUrlWithPage(url, currentPage + 1);
-      }
-      autoPagerState.nextUrl = resolveUnloadedNextUrl(autoPagerState.nextUrl);
-      if (inserted > 0) {
-        applyAll();
-        refreshObserverRoots();
-      }
-    } catch (e) {
-      // 自动补页失败时静默降级，避免影响其他功能
-    } finally {
-      autoPagerState.loading = false;
-      maybeAutoLoadNextPage();
-    }
-  }
-
-  function maybeAutoLoadNextPage() {
-    if (!autoPagerState.enabled || autoPagerState.loading) return;
-    if (!hasHiddenRepliesOnPage()) return;
-    const docEl = document.documentElement;
-    const remain = Math.max(docEl.scrollHeight - (window.scrollY + window.innerHeight), 0);
-    if (remain <= AUTO_PAGER_BOTTOM_THRESHOLD) {
-      loadNextPageReplies();
-    }
-  }
-
-  function initAutoPager() {
-    if (autoPagerState.bound) return;
-    if (!isPostPage()) return;
-    autoPagerState.currentUrl = location.href;
-    autoPagerState.nextUrl = resolveUnloadedNextUrl(resolveNextPageUrl(document, location.href));
-    autoPagerState.enabled = !!autoPagerState.nextUrl;
-    autoPagerState.loadedUrls.add(normalizeUrlForCompare(location.href));
-    if (!autoPagerState.enabled) return;
-
-    autoPagerState.bound = true;
-    let ticking = false;
-    const onScroll = () => {
-      if (ticking) return;
-      ticking = true;
-      requestAnimationFrame(() => {
-        ticking = false;
-        maybeAutoLoadNextPage();
-      });
-    };
-    window.addEventListener('scroll', onScroll, { passive: true });
-    window.addEventListener('resize', onScroll, { passive: true });
-  }
-
   function applyThreadListBlacklist() {
     const tbody = document.getElementById('tbody');
     if (!tbody) return;
 
     const rows = Array.from(tbody.children).filter((el) => el.tagName === 'TR');
     rows.forEach((row) => {
-      const authorLink = row.querySelector('td:nth-child(3) a[href*="search="]');
+      const authorLink = row.querySelector('td:nth-child(3) a[href*="search="], td:nth-child(3) a[href*="authorid="], td:nth-child(3) a[href*="uid="]');
       if (!authorLink) return;
 
       const authorName = (authorLink.textContent || '').trim();
@@ -820,7 +635,7 @@
     el.style.position = 'fixed';
     el.style.right = '12px';
     el.style.bottom = '12px';
-    el.style.zIndex = '2147483646';
+    el.style.zIndex = String(ZINDEX_TOOLBAR);
     el.style.padding = '8px 10px';
     el.style.display = 'flex';
     el.style.gap = '8px';
@@ -860,7 +675,7 @@
     el.style.position = 'fixed';
     el.style.right = '12px';
     el.style.bottom = '60px';
-    el.style.zIndex = '2147483646';
+    el.style.zIndex = String(ZINDEX_TOOLBAR);
     el.style.width = '420px';
     el.style.maxWidth = 'calc(100vw - 24px)';
     el.style.maxHeight = '68vh';
@@ -891,13 +706,13 @@
           renderManagerPanel();
         }
       } else if (action === 'clear-all') {
-        clearBlacklist();
-        renderManagerPanel();
+        if (clearBlacklist()) {
+          renderManagerPanel();
+        }
       } else if (action === 'copy-export') {
         const ta = el.querySelector('textarea[data-role="backup"]');
         if (ta instanceof HTMLTextAreaElement) {
-          ta.select();
-          document.execCommand('copy');
+          copyToClipboard(ta.value);
         }
       } else if (action === 'refresh-export') {
         const ta = el.querySelector('textarea[data-role="backup"]');
@@ -1007,6 +822,40 @@
     return el;
   }
 
+  // 通用分页组件渲染
+  function renderPagination(currentPage, totalPages, actionPrefix) {
+    return `
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+        <button class="tm-btn" data-action="${actionPrefix}-prev" ${currentPage <= 1 ? 'disabled' : ''}>上一页</button>
+        <span class="tm-sub">第 ${currentPage} / ${totalPages} 页</span>
+        <button class="tm-btn" data-action="${actionPrefix}-next" ${currentPage >= totalPages ? 'disabled' : ''}>下一页</button>
+      </div>
+    `;
+  }
+
+  // 现代 Clipboard API 复制
+  async function copyToClipboard(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        alert('已复制到剪贴板');
+      } else {
+        // 降级方案
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        alert('已复制到剪贴板');
+      }
+    } catch (e) {
+      alert('复制失败：' + e.message);
+    }
+  }
+
   function renderManagerPanel() {
     const el = ensureManagerPanel();
     const q = managerQuery.trim().toLowerCase();
@@ -1072,21 +921,13 @@
         <div class="tm-section">
           <div class="tm-title">用户名（${names.length}）</div>
           <ul class="tm-list">${nameHtml}</ul>
-          <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
-            <button class="tm-btn" data-action="page-name-prev" ${managerNamePage <= 1 ? 'disabled' : ''}>上一页</button>
-            <span class="tm-sub">第 ${managerNamePage} / ${namePageCount} 页</span>
-            <button class="tm-btn" data-action="page-name-next" ${managerNamePage >= namePageCount ? 'disabled' : ''}>下一页</button>
-          </div>
+          ${renderPagination(managerNamePage, namePageCount, 'page-name')}
         </div>
 
         <div class="tm-section">
           <div class="tm-title">UID（${uids.length}）</div>
           <ul class="tm-list">${uidHtml}</ul>
-          <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
-            <button class="tm-btn" data-action="page-uid-prev" ${managerUidPage <= 1 ? 'disabled' : ''}>上一页</button>
-            <span class="tm-sub">第 ${managerUidPage} / ${uidPageCount} 页</span>
-            <button class="tm-btn" data-action="page-uid-next" ${managerUidPage >= uidPageCount ? 'disabled' : ''}>下一页</button>
-          </div>
+          ${renderPagination(managerUidPage, uidPageCount, 'page-uid')}
         </div>
 
         <div class="tm-section">
@@ -1097,11 +938,7 @@
             <button class="tm-btn tm-btn-primary" data-action="add-keyword">添加</button>
           </div>
           <ul class="tm-list" style="margin-top:8px;">${keywordHtml}</ul>
-          <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
-            <button class="tm-btn" data-action="page-keyword-prev" ${managerKeywordPage <= 1 ? 'disabled' : ''}>上一页</button>
-            <span class="tm-sub">第 ${managerKeywordPage} / ${keywordPageCount} 页</span>
-            <button class="tm-btn" data-action="page-keyword-next" ${managerKeywordPage >= keywordPageCount ? 'disabled' : ''}>下一页</button>
-          </div>
+          ${renderPagination(managerKeywordPage, keywordPageCount, 'page-keyword')}
         </div>
 
         <div class="tm-section" style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -1148,7 +985,13 @@
   }
 
   function extractThreadTitles(doc) {
-    const selectors = ['a[href*="htm_data/"][href*=".html"]', 'a[href*="read.php?tid="]', 'h3 a[href]', 'tr td h3 a[href]'];
+    // 更精确的选择器，优先匹配主题链接
+    const selectors = [
+      'a[href*="htm_data/"][href*=".html"]',
+      'a[href*="read.php?tid="]',
+      'tr h3 a[href]',
+      'tbody tr td:nth-child(2) a[href]'
+    ];
     const titles = [];
     const seen = new Set();
 
@@ -1180,12 +1023,27 @@
     if (cached && now - cached.ts < HISTORY_CACHE_TTL) return cached.data;
     if (!searchUrl) return [];
 
-    const resp = await fetch(searchUrl, { credentials: 'include' });
-    const html = await resp.text();
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    const titles = extractThreadTitles(doc);
-    historyCache.set(userKey, { ts: now, data: titles });
-    return titles;
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+      const resp = await fetch(searchUrl, {
+        credentials: 'include',
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+      const html = await resp.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const titles = extractThreadTitles(doc);
+      historyCache.set(userKey, { ts: now, data: titles });
+      return titles;
+    } catch (e) {
+      console.warn('获取用户历史失败:', e);
+      return [];
+    }
   }
 
   function ensureCard() {
@@ -1195,7 +1053,7 @@
     const el = document.createElement('div');
     el.className = 'tm-card';
     el.style.position = 'fixed';
-    el.style.zIndex = '2147483647';
+    el.style.zIndex = String(ZINDEX_CARD);
     el.style.width = '360px';
     el.style.maxWidth = 'calc(100vw - 24px)';
     el.style.maxHeight = '62vh';
@@ -1216,7 +1074,7 @@
     hideCardTimer = window.setTimeout(() => {
       if (cardEl) cardEl.style.display = 'none';
       activeAnchor = null;
-    }, 180);
+    }, CARD_HIDE_DELAY_MS);
   }
 
   function escapeHtml(s) {
@@ -1278,21 +1136,27 @@
 
     lastCardPoint = { x, y };
 
+    // 使用缓存的尺寸或首次测量
+    if (!cachedCardSize) {
+      el.style.display = 'block';
+      el.style.left = `${x + margin}px`;
+      el.style.top = `${y + margin}px`;
+      cachedCardSize = {
+        width: el.offsetWidth,
+        height: el.offsetHeight
+      };
+    }
+
     let left = x + margin;
     let top = y + margin;
-    el.style.display = 'block';
 
-    // 先粗定位，再读取真实尺寸进行二次边界校正，避免展开后超出可视区。
-    el.style.left = `${left}px`;
-    el.style.top = `${top}px`;
-
-    const width = el.offsetWidth;
-    const height = el.offsetHeight;
-    if (left + width > vw - 6) left = Math.max(6, x - width - margin);
-    if (top + height > vh - 6) top = Math.max(6, vh - height - 6);
+    // 使用缓存尺寸进行边界检查
+    if (left + cachedCardSize.width > vw - 6) left = Math.max(6, x - cachedCardSize.width - margin);
+    if (top + cachedCardSize.height > vh - 6) top = Math.max(6, vh - cachedCardSize.height - 6);
     if (top < 6) top = 6;
     if (left < 6) left = 6;
 
+    el.style.display = 'block';
     el.style.left = `${left}px`;
     el.style.top = `${top}px`;
   }
@@ -1304,6 +1168,7 @@
     const userKey = `${uid || ''}::${normalizeName(userName)}`;
 
     activeAnchor = anchor;
+    cachedCardSize = null; // 重置缓存以适应新内容
     renderCardLoading(userName, uid);
     positionCard(evt.clientX, evt.clientY);
 
@@ -1318,6 +1183,7 @@
 
     if (activeAnchor !== anchor) return;
 
+    cachedCardSize = null; // 内容变化后重置缓存
     renderCardContent(userName, uid, history, expanded);
     positionCard(evt.clientX, evt.clientY);
 
@@ -1337,6 +1203,7 @@
         renderManagerPanel();
       } else if (action === 'toggle') {
         expanded = !expanded;
+        cachedCardSize = null; // 展开/收起时重置缓存
         renderCardContent(userName, uid, history, expanded);
         positionCard(lastCardPoint.x, lastCardPoint.y);
       }
@@ -1344,9 +1211,27 @@
   }
 
   function bindHoverCards() {
-    const anchors = document.querySelectorAll('a[href*="search="], a[href*="uid="], a[href*="touid="]');
+    const anchors = document.querySelectorAll('a[href*="search="], a[href*="uid="], a[href*="touid="], a[href*="authorid="]');
     anchors.forEach((a) => {
       if (a.dataset.tmBlacklistHoverBound === '1') return;
+
+      // 排除分页链接：检查是否包含 page= 或父元素是否为分页区域
+      const href = a.getAttribute('href') || '';
+      if (/page=/i.test(href) || a.closest('.pages, .pagination, [class*="page"]')) {
+        return;
+      }
+
+      // 排除 search=today 等非用户搜索链接
+      if (/search=(today|digest|hot)/i.test(href)) {
+        return;
+      }
+
+      // 排除文本为"下一页"、"上一页"、纯数字等分页按钮
+      const text = (a.textContent || '').trim();
+      if (/^(下一页|上一頁|上一页|下一頁|首页|尾页|首頁|尾頁|\d+|»|«|>|<|\.\.\.|\[|\])$/i.test(text)) {
+        return;
+      }
+
       a.dataset.tmBlacklistHoverBound = '1';
 
       a.addEventListener('mouseenter', (evt) => {
@@ -1355,6 +1240,7 @@
       });
 
       a.addEventListener('mousemove', (evt) => {
+        // 限流：只在卡片已显示且锚点匹配时更新位置
         if (activeAnchor === a && cardEl && cardEl.style.display !== 'none') {
           positionCard(evt.clientX, evt.clientY);
         }
@@ -1396,7 +1282,7 @@
     timer = window.setTimeout(() => {
       applyAll();
       refreshObserverRoots();
-    }, 140);
+    }, DEBOUNCE_APPLY_MS);
   });
 
   function refreshObserverRoots() {
@@ -1406,7 +1292,9 @@
   }
 
   refreshObserverRoots();
-  initAutoPager();
 
+  // 初始化时构建关键词正则
+  rebuildKeywordRegex();
   applyAll();
 })();
+
